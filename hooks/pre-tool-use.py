@@ -62,14 +62,41 @@ def check_destructive(command: str) -> dict:
                 "pattern": "git push --force"
             }
 
-    # Check rm -rf / -fr patterns
-    if re.search(DESTRUCTIVE_PATTERNS["rm -rf"], command, re.IGNORECASE) or \
-       re.search(DESTRUCTIVE_PATTERNS["rm -fr"], command, re.IGNORECASE):
-        return {
-            "blocked": True,
-            "reason": "rm -rf can destroy entire directories. Consider using safer deletion.",
-            "pattern": "rm -rf"
-        }
+    # Check rm -rf / -fr / -r -f / -f -r / --recursive --force
+    if "rm" in cmd_lower:
+        tokens = cmd_lower.split()
+        # Find index of rm
+        try:
+            rm_idx = -1
+            for idx, token in enumerate(tokens):
+                if token == "rm" or token.endswith("/rm"):
+                    rm_idx = idx
+                    break
+
+            if rm_idx != -1:
+                has_r = False
+                has_f = False
+                for token in tokens[rm_idx+1:]:
+                    # Stop checking if we hit a pipe or another command separator
+                    if token in [";", "&&", "||", "|"]:
+                        break
+                    if token.startswith("-") and not token.startswith("--"):
+                        if "r" in token or "R" in token:
+                            has_r = True
+                        if "f" in token:
+                            has_f = True
+                    elif token == "--recursive":
+                        has_r = True
+                    elif token == "--force":
+                        has_f = True
+                if has_r and has_f:
+                    return {
+                        "blocked": True,
+                        "reason": "rm -rf can destroy entire directories. Consider using safer deletion.",
+                        "pattern": "rm -rf"
+                    }
+        except Exception:
+            pass
 
     # DROP TABLE
     if re.search(DESTRUCTIVE_PATTERNS["DROP TABLE"], command, re.IGNORECASE):
@@ -89,13 +116,14 @@ def check_destructive(command: str) -> dict:
         }
 
     # DELETE FROM without WHERE
-    match = re.search(DESTRUCTIVE_PATTERNS["DELETE FROM no WHERE"], command, re.IGNORECASE)
-    if match and "WHERE" not in command.upper():
-        return {
-            "blocked": True,
-            "reason": "DELETE FROM without WHERE deletes ALL rows. Add a WHERE clause.",
-            "pattern": "DELETE FROM (no WHERE)"
-        }
+    if "delete from" in cmd_lower:
+        pos = cmd_lower.find("delete from")
+        if "where" not in cmd_lower[pos:]:
+            return {
+                "blocked": True,
+                "reason": "DELETE FROM without WHERE deletes ALL rows. Add a WHERE clause.",
+                "pattern": "DELETE FROM (no WHERE)"
+            }
 
     return {"blocked": False, "reason": None, "pattern": None}
 
