@@ -6,7 +6,7 @@ A CLI tool that reviews GitHub pull requests and outputs structured Markdown fee
 
 Usage:
     python claude_review.py --pr https://github.com/owner/repo/pull/123
-    # Or set GITHUB_TOKEN and ANTHROPIC_API_KEY as environment variables
+    # Or set GITHUB_TOKEN and ANTHROPIC_API_KEY / NINEROUTER_KEY as environment variables
 """
 
 import argparse
@@ -15,7 +15,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 
 class GitHubClient:
@@ -68,18 +68,17 @@ class GitHubClient:
 class ClaudeReviewer:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.api_url = "https://api.anthropic.com/v1/messages"
 
     def review_pr(self, pr_info: Dict, files: List[Dict], diff: str) -> str:
         # Prepare the prompt for Claude
         prompt = self._build_prompt(pr_info, files, diff)
 
-        # Call Claude API
+        # Call Claude API or local gateway
         try:
             response = self._call_claude(prompt)
             return response
         except Exception as e:
-            print(f"Error calling Claude API: {e}", file=sys.stderr)
+            print(f"Error calling Claude/9Router API: {e}", file=sys.stderr)
             sys.exit(1)
 
     def _build_prompt(self, pr_info: Dict, files: List[Dict], diff: str) -> str:
@@ -90,7 +89,7 @@ class ClaudeReviewer:
         changed_files = [f['filename'] for f in files]
 
         # Limit diff size to avoid token limits
-        max_diff_chars = 8000
+        max_diff_chars = 12000
         if len(diff) > max_diff_chars:
             diff = diff[:max_diff_chars] + "\n\n... (diff truncated)"
 
@@ -103,7 +102,9 @@ PR Information:
 - Changed Files: {', '.join(changed_files)}
 
 Diff:
+```diff
 {diff}
+```
 
 Please provide your review in the following Markdown structure:
 
@@ -111,7 +112,7 @@ Please provide your review in the following Markdown structure:
 [2-3 sentences summarizing the changes]
 
 ## Risks
-- [List any potential risks, bugs, or concerns]
+- [List any potential risks, security issues, bugs, or concerns]
 
 ## Improvements
 - [List suggestions for improvement]
@@ -119,48 +120,73 @@ Please provide your review in the following Markdown structure:
 ## Confidence
 [Low / Medium / High]
 
-Be concise, constructive, and focus on the most important aspects."""
+Be concise, constructive, and focus on the most important aspects. Do not output any conversational introduction or wrapping, just start directly with the markdown headers."""
         return prompt
 
     def _call_claude(self, prompt: str) -> str:
-        # Note: This is a simplified implementation. In practice, you'd use the anthropic library.
-        # For this example, we'll simulate the API call structure.
-        # You need to install the anthropic package: pip install anthropic
+        # Check if we should use local 9Router
+        ninerouter_url = os.getenv("NINEROUTER_URL", "http://localhost:20128")
+        ninerouter_key = os.getenv("NINEROUTER_KEY", "")
 
-        # Since we cannot make actual API calls in this environment without the package,
-        # we'll return a placeholder. In a real implementation, you would:
-        # 1. Import anthropic
-        # 2. Create a client with your API key
-        # 3. Send a message and get the response
+        use_ninerouter = False
+        try:
+            req = urllib.request.Request(f"{ninerouter_url}/api/health")
+            with urllib.request.urlopen(req, timeout=1.5) as response:
+                if response.status == 200:
+                    use_ninerouter = True
+        except Exception:
+            pass
 
-        # For demonstration, we'll return a structured response based on the prompt.
-        # In a real scenario, replace this with actual API call.
+        if use_ninerouter:
+            url = f"{ninerouter_url}/v1/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+            }
+            if ninerouter_key:
+                headers["Authorization"] = f"Bearer {ninerouter_key}"
 
-        # Placeholder response - in reality, this comes from Claude
-        return """## Summary
-This PR introduces changes to improve the codebase. The modifications are focused on [specific area] and appear to be well-implemented.
+            data = {
+                "model": "code",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "stream": False
+            }
 
-## Risks
-- Potential edge case not covered in tests
-- Possible performance impact in high-load scenarios
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode("utf-8"),
+                headers=headers,
+                method="POST"
+            )
 
-## Improvements
-- Add more comprehensive unit tests
-- Consider refactoring complex functions for better readability
-- Document any public API changes
+            try:
+                with urllib.request.urlopen(req) as response:
+                    res_data = json.loads(response.read().decode("utf-8"))
+                    return res_data["choices"][0]["message"]["content"]
+            except Exception as e:
+                print(f"Warning: 9Router call failed ({e}). Falling back to standard Anthropic API...", file=sys.stderr)
 
-## Confidence
-Medium"""
-
-        # Actual implementation would be:
-        # import anthropic
-        # client = anthropic.Anthropic(api_key=self.api_key)
-        # message = client.messages.create(
-        #     model="claude-3-opus-20240229",
-        #     max_tokens=1000,
-        #     messages=[{"role": "user", "content": prompt}]
-        # )
-        # return message.content[0].text
+        # Standard Anthropic API call as fallback
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        data = {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            return res_data["content"][0]["text"]
 
 
 def parse_pr_url(url: str) -> Tuple[str, str, int]:
@@ -186,14 +212,10 @@ def main():
 
     # Get tokens from args or environment
     github_token = args.github_token or os.getenv('GITHUB_TOKEN')
-    anthropic_key = args.anthropic_key or os.getenv('ANTHROPIC_API_KEY')
+    anthropic_key = args.anthropic_key or os.getenv('ANTHROPIC_API_KEY') or "placeholder-key"
 
     if not github_token:
         print("Error: GitHub token required. Use --github-token or set GITHUB_TOKEN env var.", file=sys.stderr)
-        sys.exit(1)
-
-    if not anthropic_key:
-        print("Error: Anthropic API key required. Use --anthropic-key or set ANTHROPIC_API_KEY env var.", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -208,7 +230,7 @@ def main():
     files = github_client.get_pr_files(owner, repo, pr_number)
     diff = github_client.get_pr_diff(owner, repo, pr_number)
 
-    # Review with Claude
+    # Review with Claude / 9Router
     reviewer = ClaudeReviewer(anthropic_key)
     review = reviewer.review_pr(pr_info, files, diff)
 
